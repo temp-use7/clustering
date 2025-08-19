@@ -1,0 +1,25 @@
+syntax = "proto3";
+package cluster.v1;
+option go_package = "clustering/api/proto/cluster;clusterpb";
+
+message Empty {}
+
+message ClusterStatus {
+  string leader = 1;
+  int32 voter_count = 2;
+  int32 nonvoter_count = 3;
+}
+
+message ReconfigureRequest {
+  int32 desired_voters = 1;
+  int32 desired_nonvoters = 2;
+}
+
+message ReconfigureResponse { bool accepted = 1; }
+
+service ClusterService {
+  rpc GetStatus(Empty) returns (ClusterStatus);
+  rpc ReconfigureMembership(ReconfigureRequest) returns (ReconfigureResponse);
+}
+
+

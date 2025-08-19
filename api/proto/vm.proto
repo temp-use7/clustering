@@ -1,0 +1,29 @@
+syntax = "proto3";
+package cluster.v1;
+option go_package = "clustering/api/proto/vm;vmpb";
+
+message Empty {}
+
+message VM {
+  string id = 1;
+  string name = 2;
+  string node_id = 3;
+  int32 cpu = 4;
+  int32 memory = 5;
+  int32 disk = 6;
+  string phase = 7;
+}
+
+message ListVMsResponse { repeated VM vms = 1; }
+message UpsertVMRequest { VM vm = 1; }
+message DeleteVMRequest { string id = 1; }
+message MigrateRequest { string id = 1; string target_node = 2; }
+
+service VMService {
+  rpc ListVMs(Empty) returns (ListVMsResponse);
+  rpc UpsertVM(UpsertVMRequest) returns (Empty);
+  rpc DeleteVM(DeleteVMRequest) returns (Empty);
+  rpc Migrate(MigrateRequest) returns (Empty);
+}
+
+
