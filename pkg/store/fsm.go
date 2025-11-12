@@ -16,7 +16,7 @@ type FSM struct {
 }
 
 func NewFSM() *FSM {
-	return &FSM{state: api.ClusterState{Nodes: map[string]api.Node{}, VMs: map[string]api.VM{}, Networks: map[string]api.Network{}, StoragePools: map[string]api.StoragePool{}, Config: api.ClusterConfig{DesiredVoters: 5, DesiredNonVoters: 2}, ConfigVersion: 1, ConfigHistory: []api.ClusterConfig{}}}
+	return &FSM{state: api.ClusterState{Nodes: map[string]api.Node{}, VMs: map[string]api.VM{}, Templates: map[string]api.VMTemplate{}, Volumes: map[string]api.Volume{}, Networks: map[string]api.Network{}, StoragePools: map[string]api.StoragePool{}, Config: api.ClusterConfig{DesiredVoters: 5, DesiredNonVoters: 2}, ConfigVersion: 1, ConfigHistory: []api.ClusterConfig{}}}
 }
 
 func (f *FSM) Apply(l *raft.Log) interface{} {
@@ -143,6 +143,22 @@ func (f *FSM) applyCommand(c Command) interface{} {
 		var id string
 		_ = json.Unmarshal(c.Payload, &id)
 		delete(f.state.StoragePools, id)
+	case "UpsertVolume":
+		var vol api.Volume
+		_ = json.Unmarshal(c.Payload, &vol)
+		f.state.Volumes[vol.ID] = vol
+	case "DeleteVolume":
+		var id string
+		_ = json.Unmarshal(c.Payload, &id)
+		delete(f.state.Volumes, id)
+	case "UpsertTemplate":
+		var tpl api.VMTemplate
+		_ = json.Unmarshal(c.Payload, &tpl)
+		f.state.Templates[tpl.ID] = tpl
+	case "DeleteTemplate":
+		var id string
+		_ = json.Unmarshal(c.Payload, &id)
+		delete(f.state.Templates, id)
 	}
 	return nil
 }

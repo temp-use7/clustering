@@ -65,6 +65,44 @@ func TestFSMNetworkAndStorageCRUD(t *testing.T) {
 	}
 }
 
+func TestFSMVolumeCRUD(t *testing.T) {
+	f := NewFSM()
+	vol := api.Volume{ID: "vol1", Size: 10, Node: "n1"}
+	if r := f.Apply(mkLog(NewCommand("UpsertVolume", vol))); r != nil {
+		t.Fatalf("upsert vol: %v", r)
+	}
+	st := f.GetStateCopy()
+	if len(st.Volumes) != 1 {
+		t.Fatalf("want 1 volume got %d", len(st.Volumes))
+	}
+	if r := f.Apply(mkLog(NewCommand("DeleteVolume", "vol1"))); r != nil {
+		t.Fatalf("del vol: %v", r)
+	}
+	st2 := f.GetStateCopy()
+	if len(st2.Volumes) != 0 {
+		t.Fatalf("want 0 volumes got %d", len(st2.Volumes))
+	}
+}
+
+func TestFSMTemplateCRUD(t *testing.T) {
+	f := NewFSM()
+	tpl := api.VMTemplate{ID: "tpl1", Name: "small", Resources: api.Resources{CPU: 200, Memory: 256, Disk: 5}}
+	if r := f.Apply(mkLog(NewCommand("UpsertTemplate", tpl))); r != nil {
+		t.Fatalf("upsert tpl: %v", r)
+	}
+	st := f.GetStateCopy()
+	if len(st.Templates) != 1 {
+		t.Fatalf("want 1 tpl got %d", len(st.Templates))
+	}
+	if r := f.Apply(mkLog(NewCommand("DeleteTemplate", "tpl1"))); r != nil {
+		t.Fatalf("del tpl: %v", r)
+	}
+	st2 := f.GetStateCopy()
+	if len(st2.Templates) != 0 {
+		t.Fatalf("want 0 tpl got %d", len(st2.Templates))
+	}
+}
+
 // helpers to emulate raft.Log and SnapshotSink
 func mkLog(c Command) *raft.Log { b, _ := json.Marshal(c); return &raft.Log{Data: b} }
 

@@ -3,6 +3,7 @@ package nodesync
 import (
 	"context"
 	"log"
+	"strconv"
 	"time"
 
 	"clustering/pkg/api"
@@ -14,6 +15,7 @@ type MemberInfo struct {
 	Addr   string
 	Role   string
 	Status string // Alive/Failed/Left
+	Tags   map[string]string
 }
 
 type ListMembersFunc func() []MemberInfo
@@ -48,17 +50,32 @@ func (c *Controller) syncOnce() {
 	}
 	members := c.list()
 	for _, m := range members {
-		// Address is informational; we'll keep the Serf-provided IP:port
-		n := api.Node{
-			ID:       m.ID,
-			Address:  m.Addr,
-			Role:     m.Role,
-			Voter:    false,
-			Capacity: api.Resources{CPU: 8000, Memory: 32768, Disk: 512},
-			Status:   m.Status,
-		}
+		n := MemberToNode(m)
 		if err := c.store.Apply(context.Background(), store.NewCommand("UpsertNode", n)); err != nil {
 			log.Printf("nodesync upsert %s: %v", m.ID, err)
 		}
 	}
+}
+
+// MemberToNode converts MemberInfo into api.Node, reading capacity tags when present.
+func MemberToNode(m MemberInfo) api.Node {
+	n := api.Node{ID: m.ID, Address: m.Addr, Role: m.Role, Voter: false, Capacity: api.Resources{CPU: 8000, Memory: 32768, Disk: 512}, Status: m.Status}
+	if m.Tags != nil {
+		if v, ok := m.Tags["cpu"]; ok {
+			if iv, err := strconv.Atoi(v); err == nil {
+				n.Capacity.CPU = iv
+			}
+		}
+		if v, ok := m.Tags["memory"]; ok {
+			if iv, err := strconv.Atoi(v); err == nil {
+				n.Capacity.Memory = iv
+			}
+		}
+		if v, ok := m.Tags["disk"]; ok {
+			if iv, err := strconv.Atoi(v); err == nil {
+				n.Capacity.Disk = iv
+			}
+		}
+	}
+	return n
 }

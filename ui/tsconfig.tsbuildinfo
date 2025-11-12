@@ -1,1 +1,1 @@
-{"root":["./src/main.tsx","./src/routes/app.tsx","./src/routes/dashboard.tsx","./src/routes/health.tsx","./src/routes/members.tsx","./src/routes/nodes.tsx","./src/routes/vms.tsx"],"version":"5.9.2"}
+{"root":["./src/main.tsx","./src/routes/app.tsx","./src/routes/audit.tsx","./src/routes/config.tsx","./src/routes/dashboard.tsx","./src/routes/health.tsx","./src/routes/members.tsx","./src/routes/metrics.tsx","./src/routes/networks.tsx","./src/routes/nodes.tsx","./src/routes/storage.tsx","./src/routes/templates.tsx","./src/routes/vms.tsx"],"version":"5.9.2"}

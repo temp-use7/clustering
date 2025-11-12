@@ -37,6 +37,8 @@ type VMSchedulingPolicy struct {
 type ClusterState struct {
 	Nodes         map[string]Node        `json:"nodes"`
 	VMs           map[string]VM          `json:"vms"`
+	Templates     map[string]VMTemplate  `json:"templates"`
+	Volumes       map[string]Volume      `json:"volumes"`
 	Networks      map[string]Network     `json:"networks"`
 	StoragePools  map[string]StoragePool `json:"storagePools"`
 	Config        ClusterConfig          `json:"config"`
@@ -67,4 +69,13 @@ type StoragePool struct {
 	ID   string `json:"id"`
 	Type string `json:"type"` // e.g., local, nfs, iscsi (planned)
 	Size int    `json:"size"` // GiB
+}
+
+// VMTemplate metadata for cloning VMs quickly (metadata-only placeholder).
+type VMTemplate struct {
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	BaseImage string            `json:"baseImage"`
+	Resources Resources         `json:"resources"`
+	Labels    map[string]string `json:"labels"`
 }

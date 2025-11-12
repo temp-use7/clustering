@@ -25,3 +25,21 @@ func TestPlanDemote(t *testing.T) {
 		t.Fatalf("unexpected plan: add=%v promote=%v demote=%v", add, promote, demote)
 	}
 }
+
+func TestPlanTreatsDesiredVotersMinimumOne(t *testing.T) {
+	existing := []ExistingServer{{ID: "n1", Suffrage: "voter"}}
+	alive := map[string]string{"n1": "a1"}
+	add, promote, demote := Plan(existing, alive, 0)
+	if len(add) != 0 || len(promote) != 0 || len(demote) != 0 {
+		t.Fatalf("unexpected plan for desired=0: add=%v promote=%v demote=%v", add, promote, demote)
+	}
+}
+
+func TestPlanAddsNonvoterForNewAlive(t *testing.T) {
+	existing := []ExistingServer{{ID: "n1", Suffrage: "voter"}}
+	alive := map[string]string{"n1": "a1", "nX": "aX"}
+	add, promote, demote := Plan(existing, alive, 1)
+	if len(add) != 1 || add[0] != "nX" || len(promote) != 0 || len(demote) != 0 {
+		t.Fatalf("unexpected plan: add=%v promote=%v demote=%v", add, promote, demote)
+	}
+}

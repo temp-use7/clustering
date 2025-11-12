@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"clustering/pkg/membership"
@@ -16,12 +17,18 @@ func main() {
 		serfBind  string
 		join      string
 		joinToken string
+		cpu       int
+		memory    int
+		disk      int
 	)
 	flag.StringVar(&httpAddr, "http", ":9090", "node agent http addr")
 	flag.StringVar(&nodeID, "node-id", "node-1", "node id")
 	flag.StringVar(&serfBind, "serf-bind", ":7947", "serf bind addr")
 	flag.StringVar(&join, "join", "", "comma separated serf peers to join")
 	flag.StringVar(&joinToken, "join-token", "", "shared join token for control-plane validation")
+	flag.IntVar(&cpu, "cpu", 8000, "capacity CPU (millicores)")
+	flag.IntVar(&memory, "memory", 32768, "capacity memory (MiB)")
+	flag.IntVar(&disk, "disk", 512, "capacity disk (GiB)")
 	flag.Parse()
 
 	s, _ := membership.MustStartSerf(membership.Config{NodeID: nodeID, BindAddr: serfBind})
@@ -34,7 +41,7 @@ func main() {
 			httpPort = httpPort[i+1:]
 		}
 	}
-	tags := map[string]string{"role": "node", "http": httpPort}
+	tags := map[string]string{"role": "node", "http": httpPort, "cpu": strconv.Itoa(cpu), "memory": strconv.Itoa(memory), "disk": strconv.Itoa(disk)}
 	if joinToken != "" {
 		tags["token"] = joinToken
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 )
@@ -14,7 +15,7 @@ func main() {
 	flag.StringVar(&ui, "ui", "http://localhost:8080", "UI base URL")
 	flag.Parse()
 	if len(os.Args) < 2 {
-		fmt.Println("usage: clustectl [nodes|vms|networks|storagepools|config] ...")
+		fmt.Println("usage: clustectl [nodes|vms|volumes|networks|storagepools|config|audit|metrics] ...")
 		return
 	}
 	switch os.Args[1] {
@@ -66,6 +67,42 @@ func main() {
 			}
 			b, _ := json.Marshal(body)
 			resp, err := http.Post(ui+"/api/vms/delete", "application/json", bytes.NewReader(b))
+			if err != nil {
+				panic(err)
+			}
+			_ = resp.Body.Close()
+			fmt.Println("ok")
+		} else if os.Args[2] == "clone" {
+			var body map[string]any
+			if err := json.NewDecoder(os.Stdin).Decode(&body); err != nil {
+				panic(err)
+			}
+			b, _ := json.Marshal(body)
+			resp, err := http.Post(ui+"/api/vms/clone", "application/json", bytes.NewReader(b))
+			if err != nil {
+				panic(err)
+			}
+			_ = resp.Body.Close()
+			fmt.Println("ok")
+		} else if os.Args[2] == "migrate" {
+			var body map[string]any
+			if err := json.NewDecoder(os.Stdin).Decode(&body); err != nil {
+				panic(err)
+			}
+			b, _ := json.Marshal(body)
+			resp, err := http.Post(ui+"/api/vms/migrate", "application/json", bytes.NewReader(b))
+			if err != nil {
+				panic(err)
+			}
+			_ = resp.Body.Close()
+			fmt.Println("ok")
+		} else if os.Args[2] == "snapshot" {
+			var body map[string]any
+			if err := json.NewDecoder(os.Stdin).Decode(&body); err != nil {
+				panic(err)
+			}
+			b, _ := json.Marshal(body)
+			resp, err := http.Post(ui+"/api/vms/snapshot", "application/json", bytes.NewReader(b))
 			if err != nil {
 				panic(err)
 			}
@@ -150,6 +187,45 @@ func main() {
 			_ = resp.Body.Close()
 			fmt.Println("ok")
 		}
+	case "volumes":
+		if len(os.Args) == 2 {
+			resp, err := http.Get(ui + "/api/volumes")
+			if err != nil {
+				panic(err)
+			}
+			defer resp.Body.Close()
+			var vols map[string]map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&vols); err != nil {
+				panic(err)
+			}
+			for id, v := range vols {
+				fmt.Printf("- %s: %v\n", id, v)
+			}
+		} else if os.Args[2] == "upsert" {
+			var body map[string]any
+			if err := json.NewDecoder(os.Stdin).Decode(&body); err != nil {
+				panic(err)
+			}
+			b, _ := json.Marshal(body)
+			resp, err := http.Post(ui+"/api/volumes", "application/json", bytes.NewReader(b))
+			if err != nil {
+				panic(err)
+			}
+			_ = resp.Body.Close()
+			fmt.Println("ok")
+		} else if os.Args[2] == "delete" {
+			var body map[string]any
+			if err := json.NewDecoder(os.Stdin).Decode(&body); err != nil {
+				panic(err)
+			}
+			b, _ := json.Marshal(body)
+			resp, err := http.Post(ui+"/api/volumes/delete", "application/json", bytes.NewReader(b))
+			if err != nil {
+				panic(err)
+			}
+			_ = resp.Body.Close()
+			fmt.Println("ok")
+		}
 	case "config":
 		if len(os.Args) == 2 || (len(os.Args) > 2 && os.Args[2] == "get") {
 			resp, err := http.Get(ui + "/api/config")
@@ -171,6 +247,104 @@ func main() {
 			}
 			b, _ := json.Marshal(cfg)
 			resp, err := http.Post(ui+"/api/config", "application/json", bytes.NewReader(b))
+			if err != nil {
+				panic(err)
+			}
+			_ = resp.Body.Close()
+			fmt.Println("ok")
+		} else if os.Args[2] == "history" {
+			resp, err := http.Get(ui + "/api/config/history")
+			if err != nil {
+				panic(err)
+			}
+			defer resp.Body.Close()
+			var hist []map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&hist); err != nil {
+				panic(err)
+			}
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(hist)
+		} else if os.Args[2] == "version" {
+			resp, err := http.Get(ui + "/api/config/version")
+			if err != nil {
+				panic(err)
+			}
+			defer resp.Body.Close()
+			var v map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+				panic(err)
+			}
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(v)
+		} else if os.Args[2] == "rollback" {
+			resp, err := http.Post(ui+"/api/config/rollback", "application/json", bytes.NewReader([]byte("{}")))
+			if err != nil {
+				panic(err)
+			}
+			_ = resp.Body.Close()
+			fmt.Println("ok")
+		}
+	case "audit":
+		resp, err := http.Get(ui + "/api/audit")
+		if err != nil {
+			panic(err)
+		}
+		defer resp.Body.Close()
+		io.Copy(os.Stdout, resp.Body)
+	case "metrics":
+		resp, err := http.Get(ui + "/metrics")
+		if err != nil {
+			panic(err)
+		}
+		defer resp.Body.Close()
+		io.Copy(os.Stdout, resp.Body)
+	case "templates":
+		if len(os.Args) == 2 {
+			resp, err := http.Get(ui + "/api/templates")
+			if err != nil {
+				panic(err)
+			}
+			defer resp.Body.Close()
+			var tpls map[string]map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&tpls); err != nil {
+				panic(err)
+			}
+			for id, t := range tpls {
+				fmt.Printf("- %s: %v\n", id, t)
+			}
+		} else if os.Args[2] == "upsert" {
+			var body map[string]any
+			if err := json.NewDecoder(os.Stdin).Decode(&body); err != nil {
+				panic(err)
+			}
+			b, _ := json.Marshal(body)
+			resp, err := http.Post(ui+"/api/templates", "application/json", bytes.NewReader(b))
+			if err != nil {
+				panic(err)
+			}
+			_ = resp.Body.Close()
+			fmt.Println("ok")
+		} else if os.Args[2] == "delete" {
+			var body map[string]any
+			if err := json.NewDecoder(os.Stdin).Decode(&body); err != nil {
+				panic(err)
+			}
+			b, _ := json.Marshal(body)
+			resp, err := http.Post(ui+"/api/templates/delete", "application/json", bytes.NewReader(b))
+			if err != nil {
+				panic(err)
+			}
+			_ = resp.Body.Close()
+			fmt.Println("ok")
+		} else if os.Args[2] == "instantiate" {
+			var body map[string]any
+			if err := json.NewDecoder(os.Stdin).Decode(&body); err != nil {
+				panic(err)
+			}
+			b, _ := json.Marshal(body)
+			resp, err := http.Post(ui+"/api/vms/cloneFromTemplate", "application/json", bytes.NewReader(b))
 			if err != nil {
 				panic(err)
 			}

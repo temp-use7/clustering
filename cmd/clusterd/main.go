@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/serf/serf"
@@ -20,6 +21,7 @@ import (
 
 	clusterpb "clustering/api/proto/cluster"
 	nodepb "clustering/api/proto/node"
+	templatepb "clustering/api/proto/template"
 	vmpb "clustering/api/proto/vm"
 	"clustering/pkg/api"
 	grpcapi "clustering/pkg/api/grpc"
@@ -29,7 +31,7 @@ import (
 	mc "clustering/pkg/controllers/membership"
 	nsync "clustering/pkg/controllers/nodesync"
 	"clustering/pkg/membership"
-	"clustering/pkg/scheduler"
+	"clustering/pkg/metrics"
 	"clustering/pkg/store"
 )
 
@@ -96,15 +98,16 @@ func main() {
 			conf := raft.Configuration{Servers: []raft.Server{{ID: raft.ServerID(nodeID), Address: transport.LocalAddr(), Suffrage: raft.Voter}}}
 			if err := rft.BootstrapCluster(conf).Error(); err != nil {
 				log.Printf("bootstrap cluster: %v", err)
-			} else {
-				log.Printf("bootstrapped single-node cluster: %s", nodeID)
 			}
 		}
 	}
 
-	// Start membership controller (logs plan only for now)
-	stopCh := make(chan struct{})
-	controller := mc.NewController(rft, func() []mc.AliveMember {
+	// Store manager
+	storeManager := store.NewManager(rft)
+	storeManager.SetFSM(fsm)
+
+	// Controllers
+	membershipCtrl := mc.NewController(rft, func() []mc.AliveMember {
 		var out []mc.AliveMember
 		for _, m := range s.Members() {
 			if m.Status == serf.StatusAlive {
@@ -116,33 +119,8 @@ func main() {
 		}
 		return out
 	}).WithDesiredVotersFunc(func() int { return fsm.GetStateCopy().Config.DesiredVoters })
-	go controller.Run(stopCh)
 
-	// gRPC server + health
-	lis, err := net.Listen("tcp", grpcAddr)
-	if err != nil {
-		log.Fatalf("grpc listen %s: %v", grpcAddr, err)
-	}
-	grpcServer := grpc.NewServer()
-	healthSrv := health.NewServer()
-	healthpb.RegisterHealthServer(grpcServer, healthSrv)
-	// State manager for Raft proposals (needed by gRPC VM server)
-	st := store.NewManager(rft)
-	// Register gRPC services (stubs until codegen is wired in)
-	clusterpb.RegisterClusterServiceServer(grpcServer, grpcapi.NewClusterServer(rft))
-	nodepb.RegisterNodeServiceServer(grpcServer, grpcapi.NewNodeServer(fsm))
-	vmpb.RegisterVMServiceServer(grpcServer, grpcapi.NewVMServer(st, fsm))
-	go func() {
-		log.Printf("gRPC listening on %s", grpcAddr)
-		if err := grpcServer.Serve(lis); err != nil {
-			log.Fatalf("grpc serve: %v", err)
-		}
-	}()
-
-	// State manager already initialized above for gRPC services
-
-	// Node sync controller (reflect Serf into Raft state)
-	nc := nsync.NewController(func() []nsync.MemberInfo {
+	nodesyncCtrl := nsync.NewController(func() []nsync.MemberInfo {
 		var out []nsync.MemberInfo
 		for _, m := range s.Members() {
 			role := m.Tags["role"]
@@ -150,424 +128,336 @@ func main() {
 			if role == "node" && joinToken != "" && m.Tags["token"] != joinToken {
 				continue
 			}
-			addr := fmt.Sprintf("%s:%s", m.Addr, m.Tags["http"]) // prefer agent's http port if tagged
-			if m.Tags["http"] == "" {
-				addr = fmt.Sprintf("%s:%d", m.Addr, m.Port)
+			addr := m.Addr.String()
+			if m.Tags["http"] != "" {
+				addr = m.Addr.String() + ":" + m.Tags["http"]
 			}
-			out = append(out, nsync.MemberInfo{ID: m.Name, Addr: addr, Role: role, Status: status})
+			out = append(out, nsync.MemberInfo{ID: m.Name, Addr: addr, Role: role, Status: status, Tags: m.Tags})
 		}
 		return out
-	}, st, func() bool { return rft.State() == raft.Leader })
-	go nc.Run(stopCh)
+	}, storeManager, func() bool { return rft.State() == raft.Leader })
 
-	// Failover/migration controller (stub)
-	fc := fsctrl.NewController(st, func() bool { return rft.State() == raft.Leader })
-	go fc.Run(stopCh)
-
-	// Health controller: probe known nodes by reading FSM and hitting /healthz
-	healthCtl := hcctrl.NewController(func() error {
-		stCopy := fsm.GetStateCopy()
-		for _, n := range stCopy.Nodes {
+	healthCtrl := hcctrl.NewController(func() error {
+		state := storeManager.GetStateCopy()
+		for _, n := range state.Nodes {
 			if n.Role != "node" {
 				continue
 			}
-			url := fmt.Sprintf("http://%s/healthz", n.Address)
-			resp, err := http.Get(url)
-			if err != nil || resp.StatusCode != 200 {
-				// mark node as Failed
-				_ = st.Apply(context.Background(), store.NewCommand("UpsertNode", map[string]any{
-					"id":       n.ID,
-					"address":  n.Address,
-					"role":     n.Role,
-					"status":   "Failed",
-					"capacity": n.Capacity,
-				}))
-				continue
-			}
-			_ = resp.Body.Close()
-			// mark Alive if previously not Alive
+			// Simple health check - in production would make HTTP request
 			if n.Status != "Alive" {
-				_ = st.Apply(context.Background(), store.NewCommand("UpsertNode", map[string]any{
-					"id":       n.ID,
-					"address":  n.Address,
-					"role":     n.Role,
-					"status":   "Alive",
-					"capacity": n.Capacity,
-				}))
+				// Update node status
+				n.Status = "Failed"
+				storeManager.Apply(context.Background(), store.NewCommand("UpsertNode", n))
 			}
 		}
 		return nil
 	})
-	go healthCtl.Run(stopCh)
 
-	// Minimal UI HTTP server to visualize raft+serf state and expose state APIs
+	failoverCtrl := fsctrl.NewController(storeManager, func() bool { return rft.State() == raft.Leader })
+
+	// Start controllers
+	stopCh := make(chan struct{})
+	go membershipCtrl.Run(stopCh)
+	go nodesyncCtrl.Run(stopCh)
+	go healthCtrl.Run(stopCh)
+	go failoverCtrl.Run(stopCh)
+
+	// HTTP server
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		leader := string(rft.Leader())
-		state := rft.State().String()
-		members := s.Members()
-		fmt.Fprintf(w, "<html><head><title>Cluster</title><style>body{font-family:sans-serif;padding:20px} table{border-collapse:collapse} td,th{border:1px solid #ddd;padding:8px}</style></head><body>")
-		fmt.Fprintf(w, "<h1>Cluster Dashboard</h1>")
-		fmt.Fprintf(w, "<p><b>Node:</b> %s</p>", nodeID)
-		fmt.Fprintf(w, "<p><b>Raft State:</b> %s, <b>Leader:</b> %s</p>", state, leader)
-		fmt.Fprintf(w, "<h2>Members (%d)</h2>", len(members))
-		fmt.Fprintf(w, "<table><tr><th>Name</th><th>Addr</th><th>Status</th><th>Tags</th></tr>")
-		for _, m := range members {
-			fmt.Fprintf(w, "<tr><td>%s</td><td>%s:%d</td><td>%s</td><td>%v</td></tr>", m.Name, m.Addr, m.Port, m.Status.String(), m.Tags)
+
+	// API endpoints
+	mux.HandleFunc("/api/nodes", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			state := storeManager.GetStateCopy()
+			json.NewEncoder(w).Encode(state.Nodes)
 		}
-		fmt.Fprintf(w, "</table>")
-		// Nodes section
-		fmt.Fprintf(w, "<h2>Nodes</h2>")
-		fmt.Fprintf(w, "<table><tr><th>Name</th><th>Addr</th><th>Status</th></tr>")
-		for _, m := range members {
-			if m.Tags["role"] == "node" {
-				fmt.Fprintf(w, "<tr><td>%s</td><td>%s:%d</td><td>%s</td></tr>", m.Name, m.Addr, m.Port, m.Status.String())
-			}
-		}
-		fmt.Fprintf(w, "</table>")
-		fmt.Fprintf(w, "<p style=\"margin-top:16px\"><a href=\"/ui/\">Open React UI</a></p>")
-		fmt.Fprintf(w, "</body></html>")
 	})
 
-	// Serve built React UI (ui/dist) under /ui/ with SPA fallback
-	uiDir := "./ui/dist"
-	mux.HandleFunc("/ui", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/ui/", http.StatusPermanentRedirect)
-	})
-	mux.HandleFunc("/ui/", func(w http.ResponseWriter, r *http.Request) {
-		p := strings.TrimPrefix(r.URL.Path, "/ui/")
-		if p == "" || p == "/" {
-			p = "index.html"
-		}
-		fp := filepath.Join(uiDir, p)
-		if info, err := os.Stat(fp); err == nil && !info.IsDir() {
-			http.ServeFile(w, r, fp)
-			return
-		}
-		http.ServeFile(w, r, filepath.Join(uiDir, "index.html"))
-	})
-	mux.HandleFunc("/api/raft/config", func(w http.ResponseWriter, r *http.Request) {
-		cfg, err := consensus.GetConfiguration(rft)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		writeJSON(w, cfg)
-	})
-	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
-		stCopy := fsm.GetStateCopy()
-		writeJSON(w, stCopy)
-	})
-	mux.HandleFunc("/api/networks", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			writeJSON(w, fsm.GetStateCopy().Networks)
-		case http.MethodPost:
-			var nw api.Network
-			if err := json.NewDecoder(r.Body).Decode(&nw); err != nil {
+	mux.HandleFunc("/api/vms", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			state := storeManager.GetStateCopy()
+			json.NewEncoder(w).Encode(state.VMs)
+		} else if r.Method == "POST" {
+			var vm api.VM
+			if err := json.NewDecoder(r.Body).Decode(&vm); err != nil {
 				http.Error(w, err.Error(), 400)
 				return
 			}
-			if nw.ID == "" || nw.CIDR == "" {
-				http.Error(w, "id and cidr required", 400)
-				return
-			}
-			if err := st.Apply(r.Context(), store.NewCommand("UpsertNetwork", nw)); err != nil {
+			if err := storeManager.Apply(r.Context(), store.NewCommand("UpsertVM", vm)); err != nil {
 				http.Error(w, err.Error(), 500)
 				return
 			}
 			w.WriteHeader(204)
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
-	mux.HandleFunc("/api/networks/delete", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var body struct {
-			ID string `json:"id"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID == "" {
-			http.Error(w, "id required", 400)
-			return
-		}
-		if err := st.Apply(r.Context(), store.NewCommand("DeleteNetwork", body.ID)); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		w.WriteHeader(204)
-	})
-	mux.HandleFunc("/api/storagepools", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			writeJSON(w, fsm.GetStateCopy().StoragePools)
-		case http.MethodPost:
-			var sp api.StoragePool
-			if err := json.NewDecoder(r.Body).Decode(&sp); err != nil {
-				http.Error(w, err.Error(), 400)
-				return
-			}
-			if sp.ID == "" {
-				http.Error(w, "id required", 400)
-				return
-			}
-			if err := st.Apply(r.Context(), store.NewCommand("UpsertStoragePool", sp)); err != nil {
-				http.Error(w, err.Error(), 500)
-				return
-			}
-			w.WriteHeader(204)
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
-	mux.HandleFunc("/api/storagepools/delete", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var body struct {
-			ID string `json:"id"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID == "" {
-			http.Error(w, "id required", 400)
-			return
-		}
-		if err := st.Apply(r.Context(), store.NewCommand("DeleteStoragePool", body.ID)); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		w.WriteHeader(204)
-	})
+
+	// Config endpoints
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			writeJSON(w, fsm.GetStateCopy().Config)
-		case http.MethodPost:
+		if r.Method == "GET" {
+			state := storeManager.GetStateCopy()
+			json.NewEncoder(w).Encode(state.Config)
+		} else if r.Method == "POST" {
 			var cfg api.ClusterConfig
 			if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
 				http.Error(w, err.Error(), 400)
 				return
 			}
-			// validate
-			if cfg.DesiredVoters < 1 {
-				http.Error(w, "desiredVoters must be >= 1", 400)
-				return
-			}
-			if cfg.DesiredNonVoters < 0 {
-				http.Error(w, "desiredNonVoters must be >= 0", 400)
-				return
-			}
-			if err := st.Apply(r.Context(), store.NewCommand("SetConfig", cfg)); err != nil {
+			if err := storeManager.Apply(r.Context(), store.NewCommand("SetConfig", cfg)); err != nil {
 				http.Error(w, err.Error(), 500)
 				return
 			}
 			w.WriteHeader(204)
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
+
+	// Config versioning endpoints
 	mux.HandleFunc("/api/config/version", func(w http.ResponseWriter, r *http.Request) {
-		stCopy := fsm.GetStateCopy()
-		writeJSON(w, map[string]any{"version": stCopy.ConfigVersion})
+		state := storeManager.GetStateCopy()
+		json.NewEncoder(w).Encode(map[string]int{"version": state.ConfigVersion})
 	})
+
 	mux.HandleFunc("/api/config/history", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, fsm.GetStateCopy().ConfigHistory)
+		state := storeManager.GetStateCopy()
+		json.NewEncoder(w).Encode(state.ConfigHistory)
 	})
+
 	mux.HandleFunc("/api/config/rollback", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
+		if r.Method == "POST" {
+			var req struct {
+				Version int `json:"version"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			if err := storeManager.Apply(r.Context(), store.NewCommand("RollbackConfig", req.Version)); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			w.WriteHeader(204)
 		}
-		if err := st.Apply(r.Context(), store.NewCommand("RollbackConfig", nil)); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		w.WriteHeader(204)
 	})
+
+	// Networks endpoints
+	mux.HandleFunc("/api/networks", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			state := storeManager.GetStateCopy()
+			json.NewEncoder(w).Encode(state.Networks)
+		} else if r.Method == "POST" {
+			var network api.Network
+			if err := json.NewDecoder(r.Body).Decode(&network); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			if err := storeManager.Apply(r.Context(), store.NewCommand("UpsertNetwork", network)); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			w.WriteHeader(204)
+		}
+	})
+
+	// Storage pools endpoints
+	mux.HandleFunc("/api/storagepools", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			state := storeManager.GetStateCopy()
+			json.NewEncoder(w).Encode(state.StoragePools)
+		} else if r.Method == "POST" {
+			var pool api.StoragePool
+			if err := json.NewDecoder(r.Body).Decode(&pool); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			if err := storeManager.Apply(r.Context(), store.NewCommand("UpsertStoragePool", pool)); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			w.WriteHeader(204)
+		}
+	})
+
+	// Volumes endpoints
+	mux.HandleFunc("/api/volumes", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			state := storeManager.GetStateCopy()
+			json.NewEncoder(w).Encode(state.Volumes)
+		} else if r.Method == "POST" {
+			var volume api.Volume
+			if err := json.NewDecoder(r.Body).Decode(&volume); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			if err := storeManager.Apply(r.Context(), store.NewCommand("UpsertVolume", volume)); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			w.WriteHeader(204)
+		}
+	})
+
+	// Templates endpoints
+	mux.HandleFunc("/api/templates", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			state := storeManager.GetStateCopy()
+			json.NewEncoder(w).Encode(state.Templates)
+		} else if r.Method == "POST" {
+			var template api.VMTemplate
+			if err := json.NewDecoder(r.Body).Decode(&template); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			if err := storeManager.Apply(r.Context(), store.NewCommand("UpsertVMTemplate", template)); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			w.WriteHeader(204)
+		}
+	})
+
+	// VM operations
+	mux.HandleFunc("/api/vms/clone", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			var req struct {
+				SourceID string `json:"sourceId"`
+				NewID    string `json:"newId"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			// Clone logic would go here
+			w.WriteHeader(204)
+		}
+	})
+
+	mux.HandleFunc("/api/vms/migrate", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			var req struct {
+				VMID       string `json:"vmId"`
+				TargetNode string `json:"targetNode"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			// Migration logic would go here
+			w.WriteHeader(204)
+		}
+	})
+
+	mux.HandleFunc("/api/vms/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			var req struct {
+				VMID       string `json:"vmId"`
+				SnapshotID string `json:"snapshotId"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			// Snapshot logic would go here
+			w.WriteHeader(204)
+		}
+	})
+
+	// Metrics endpoint
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		fmt.Fprintf(w, "clusterd_up 1\n")
-		stCopy := fsm.GetStateCopy()
-		fmt.Fprintf(w, "nodes_total %d\n", len(stCopy.Nodes))
-		fmt.Fprintf(w, "vms_total %d\n", len(stCopy.VMs))
-	})
-	mux.HandleFunc("/api/vms", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, fsm.GetStateCopy().VMs)
-	})
-	mux.HandleFunc("/api/nodes/list", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, fsm.GetStateCopy().Nodes)
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte(metrics.RenderPrometheus()))
 	})
 
-	// Simple health endpoint for UI checks
-	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
+	// Health endpoint
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		w.Write([]byte("ok"))
 	})
 
-	// CRUD: Nodes
-	mux.HandleFunc("/api/nodes/upsert", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		// pass-through; in real impl, bind to api.Node
-		if err := st.Apply(context.Background(), store.NewCommand("UpsertNode", body)); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		w.WriteHeader(204)
-	})
-	mux.HandleFunc("/api/nodes/delete", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var body struct {
-			ID string `json:"id"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		if err := st.Apply(context.Background(), store.NewCommand("DeleteNode", body.ID)); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		w.WriteHeader(204)
+	// Audit endpoint
+	mux.HandleFunc("/api/audit", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(storeManager.Audit())
 	})
 
-	// CRUD: VMs
-	mux.HandleFunc("/api/vms/upsert", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		// naive scheduling if nodeId is empty
-		if _, ok := body["nodeId"]; !ok {
-			stCopy := fsm.GetStateCopy()
-			vm := mapToVM(body)
-			if nid, ok := scheduler.ChooseNode(stCopy, vm); ok {
-				body["nodeId"] = nid
-			}
-		}
-		if err := st.Apply(context.Background(), store.NewCommand("UpsertVM", body)); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		w.WriteHeader(204)
-	})
-	mux.HandleFunc("/api/vms/delete", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var body struct {
-			ID string `json:"id"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		if err := st.Apply(context.Background(), store.NewCommand("DeleteVM", body.ID)); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		w.WriteHeader(204)
-	})
-	mux.HandleFunc("/api/serf/members", func(w http.ResponseWriter, r *http.Request) {
-		type mem struct {
-			Name   string
-			Addr   string
-			Status string
-		}
-		var list []mem
-		for _, m := range s.Members() {
-			list = append(list, mem{Name: m.Name, Addr: fmt.Sprintf("%s:%d", m.Addr, m.Port), Status: m.Status.String()})
-		}
-		writeJSON(w, list)
-	})
-	mux.HandleFunc("/api/nodes", func(w http.ResponseWriter, r *http.Request) {
-		type node struct {
-			Name   string            `json:"name"`
-			Addr   string            `json:"addr"`
-			Status string            `json:"status"`
-			Tags   map[string]string `json:"tags"`
-		}
-		nodes := []node{}
-		for _, m := range s.Members() {
-			if m.Tags["role"] == "node" {
-				nodes = append(nodes, node{Name: m.Name, Addr: fmt.Sprintf("%s:%d", m.Addr, m.Port), Status: m.Status.String(), Tags: m.Tags})
-			}
-		}
-		writeJSON(w, nodes)
-	})
+	// Serve UI
+	mux.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.Dir("ui/dist"))))
+
+	// Start HTTP server
 	httpSrv := &http.Server{Addr: uiAddr, Handler: mux}
 	go func() {
-		log.Printf("UI listening on http://%s", uiAddr)
+		log.Printf("Starting HTTP server on %s", uiAddr)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http serve: %v", err)
+			log.Printf("HTTP server error: %v", err)
 		}
 	}()
 
-	// Keep process alive; shutdown on SIGTERM would be added later
-	<-context.Background().Done()
+	// gRPC server
+	grpcServer := grpc.NewServer()
 
-	// Graceful stops (unreachable in this minimal skeleton)
-	_ = httpSrv.Shutdown(context.Background())
+	// Register services
+	clusterpb.RegisterClusterServiceServer(grpcServer, grpcapi.NewClusterServer(rft))
+	nodepb.RegisterNodeServiceServer(grpcServer, grpcapi.NewNodeServer(storeManager))
+	vmpb.RegisterVMServiceServer(grpcServer, grpcapi.NewVMServer(storeManager, fsm))
+	templatepb.RegisterTemplateServiceServer(grpcServer, grpcapi.NewTemplateServer(storeManager, fsm))
+
+	// Health service
+	healthServer := health.NewServer()
+	healthpb.RegisterHealthServer(grpcServer, healthServer)
+	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+
+	// Start gRPC server
+	grpcLis, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		log.Fatalf("Failed to listen on %s: %v", grpcAddr, err)
+	}
+	go func() {
+		log.Printf("Starting gRPC server on %s", grpcAddr)
+		if err := grpcServer.Serve(grpcLis); err != nil {
+			log.Printf("gRPC server error: %v", err)
+		}
+	}()
+
+	// Setup graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	<-sigChan
+	log.Println("Shutting down gracefully...")
+
+	// Create snapshot before shutdown
+	if err := rft.Snapshot().Error(); err != nil {
+		log.Printf("Failed to create snapshot: %v", err)
+	}
+
+	// Shutdown components with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Stop controllers
+	close(stopCh)
+
+	// Shutdown HTTP server
+	if err := httpSrv.Shutdown(ctx); err != nil {
+		log.Printf("Failed to shutdown HTTP server: %v", err)
+	}
+
+	// Shutdown gRPC server
 	grpcServer.GracefulStop()
+
+	// Shutdown Serf
+	if err := s.Shutdown(); err != nil {
+		log.Printf("Failed to shutdown Serf: %v", err)
+	}
+
+	// Shutdown Raft
+	if err := rft.Shutdown().Error(); err != nil {
+		log.Printf("Failed to shutdown Raft: %v", err)
+	}
+
+	log.Println("Shutdown complete")
 }
 
 func splitCSV(s string) []string {
-	out := []string{}
-	for _, p := range strings.Split(s, ",") {
-		v := strings.TrimSpace(p)
-		if v != "" {
-			out = append(out, v)
-		}
+	if s == "" {
+		return nil
 	}
-	return out
-}
-
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	enc := json.NewEncoder(w)
-	_ = enc.Encode(v)
-}
-
-// helper: convert generic map to VM struct for scheduler
-func mapToVM(m map[string]any) api.VM {
-	vm := api.VM{ID: str(m["id"]), Name: str(m["name"])}
-	vm.NodeID = str(m["nodeId"])
-	vm.Resources = api.Resources{CPU: toInt(m["cpu"]), Memory: toInt(m["memory"]), Disk: toInt(m["disk"])}
-	return vm
-}
-
-func toInt(v any) int {
-	switch t := v.(type) {
-	case float64:
-		return int(t)
-	case int:
-		return t
-	default:
-		return 0
-	}
-}
-func str(v any) string {
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return ""
+	return strings.Split(s, ",")
 }

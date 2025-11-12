@@ -65,3 +65,31 @@ func (s *VMServer) Migrate(ctx context.Context, req *vmpb.MigrateRequest) (*vmpb
 	}
 	return &vmpb.Empty{}, nil
 }
+
+// Additional parity RPCs (stubs; extend proto in real codegen)
+func (s *VMServer) Clone(ctx context.Context, srcId, newId string) (*vmpb.Empty, error) {
+	st := s.fsm.GetStateCopy()
+	vm, ok := st.VMs[srcId]
+	if !ok {
+		return &vmpb.Empty{}, nil
+	}
+	vm.ID = newId
+	vm.Name = vm.Name + "-clone"
+	return s.UpsertVM(ctx, &vmpb.UpsertVMRequest{Vm: &vmpb.VM{Id: vm.ID, Name: vm.Name, NodeId: vm.NodeID, Cpu: int32(vm.Resources.CPU), Memory: int32(vm.Resources.Memory), Disk: int32(vm.Resources.Disk), Phase: vm.Phase}})
+}
+
+func (s *VMServer) CloneFromTemplate(ctx context.Context, templateId, newId string) (*vmpb.Empty, error) {
+	st := s.fsm.GetStateCopy()
+	tpl, ok := st.Templates[templateId]
+	if !ok {
+		return &vmpb.Empty{}, nil
+	}
+	vm := api.VM{ID: newId, Name: tpl.Name + "-inst", Resources: tpl.Resources, Phase: "Pending"}
+	if nid, ok := scheduler.ChooseNode(st, vm); ok {
+		vm.NodeID = nid
+	}
+	if err := s.st.Apply(ctx, store.NewCommand("UpsertVM", vm)); err != nil {
+		return nil, err
+	}
+	return &vmpb.Empty{}, nil
+}
